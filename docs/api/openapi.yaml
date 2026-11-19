@@ -1,0 +1,269 @@
+openapi: 3.1.0
+info:
+  title: Вердикт — сервис разбора отзывов
+  version: 0.1.0
+  description: >
+    Отчёт по организации: собирает отзывы из внешнего источника, прогоняет через
+    анализаторы и возвращает вердикт. Все ошибки в одном формате
+    {code, message, details}.
+
+servers:
+  - url: http://localhost:8080/api/v1
+
+paths:
+  /organizations:
+    get:
+      summary: Поиск организаций
+      description: Поиск по названию и/или городу в справочнике источника.
+      parameters:
+        - $ref: "#/components/parameters/NameQuery"
+        - $ref: "#/components/parameters/CityQuery"
+        - $ref: "#/components/parameters/LimitQuery"
+      responses:
+        "200":
+          description: Список найденных организаций (может быть пустым).
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Organization" }
+              examples:
+                found:
+                  value:
+                    - { id: "htl_0204", name: "Hotel Arena", city: "Amsterdam" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/SourceUnavailable" }
+
+  /reports:
+    post:
+      summary: Создать отчёт по организации
+      description: >
+        Идемпотентно по заголовку Idempotency-Key. Повтор запроса с тем же ключом
+        и тем же телом возвращает прежний report_id и текущий статус без повторного
+        выполнения. Тот же ключ с другим телом — ошибка idempotency_conflict.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateReport" }
+            examples:
+              simple: { value: { organization_id: "htl_0204" } }
+      responses:
+        "201":
+          description: Отчёт создан (или возвращён существующий при повторе ключа).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/OrganizationNotFound" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        "503": { $ref: "#/components/responses/SourceUnavailable" }
+
+  /reports/{report_id}:
+    get:
+      summary: Статус и результат отчёта
+      description: >
+        Пока Job не дошёл до конечного состояния, поле verdict отсутствует.
+        В состояниях done и partial вердикт есть; в partial дополнительно поле
+        coverage показывает долю неполученных отзывов.
+      parameters:
+        - $ref: "#/components/parameters/ReportId"
+      responses:
+        "200":
+          description: Отчёт с текущим состоянием.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+              examples:
+                done:
+                  value:
+                    id: "rep_77"
+                    organization_id: "htl_0204"
+                    status: done
+                    verdict:
+                      aspects:
+                        food: { mean: 4.1, negative_share: 0.22, stable: true }
+                        service: { mean: 2.8, negative_share: 0.61, stable: false }
+                      rating_total: 3.6
+                      rating_excluding_suspicious: 3.1
+                      trend: "worsening"
+        "404": { $ref: "#/components/responses/ReportNotFound" }
+
+  /reports/{report_id}/cancel:
+    post:
+      summary: Отменить отчёт
+      description: >
+        Доступна из состояний created, collecting, analyzing. Отмена конечного
+        состояния (done, partial, insufficient, failed, cancelled) и повторная
+        отмена — ошибка invalid_transition, состояние не меняется.
+      parameters:
+        - $ref: "#/components/parameters/ReportId"
+      responses:
+        "200":
+          description: Отчёт отменён.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "404": { $ref: "#/components/responses/ReportNotFound" }
+        "409": { $ref: "#/components/responses/InvalidTransition" }
+
+components:
+  parameters:
+    NameQuery:
+      name: name
+      in: query
+      schema: { type: string, minLength: 2 }
+      description: Подстрока названия организации. Обязателен один из name/city.
+    CityQuery:
+      name: city
+      in: query
+      schema: { type: string, minLength: 2 }
+    LimitQuery:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 8, maxLength: 64 }
+      description: Уникальный ключ клиента на попытку создания отчёта (обычно UUID).
+    ReportId:
+      name: report_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^rep_[0-9]+$" }
+
+  responses:
+    BadRequest:
+      description: >
+        Неверные параметры. code=invalid_params, в details.path — какое поле
+        и что не так (например, "organization_id: обязательное поле",
+        "limit: должно быть от 1 до 50").
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            missingField:
+              value:
+                code: invalid_params
+                message: "Неверные параметры запроса"
+                details: { fields: { organization_id: "обязательное поле" } }
+    OrganizationNotFound:
+      description: code=organization_not_found, в details — переданный идентификатор.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            notFound:
+              value:
+                code: organization_not_found
+                message: "Организация не найдена"
+                details: { organization_id: "htl_9999" }
+    ReportNotFound:
+      description: code=report_not_found. Идентификаторы отчётов не угадываются и не перечисляются.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyConflict:
+      description: >
+        Тот же Idempotency-Key уже использован с другим телом запроса.
+        code=idempotency_conflict, в details — organization_id прежнего запроса.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidTransition:
+      description: >
+        Переход не разрешён (в том числе отмена конечного состояния).
+        code=invalid_transition, в details — from и to.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            cancelDone:
+              value:
+                code: invalid_transition
+                message: "Переход не разрешён"
+                details: { from: done, to: cancelled }
+    SourceUnavailable:
+      description: >
+        Источник отзывов недоступен, запрос не выполнен. code=source_unavailable.
+        Возвращается только поиском организаций, который не может ответить без
+        источника; создание отчёта при недоступном источнике принимает Job,
+        и он завершается failed/partial (см. ADR-0001).
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_params
+            - organization_not_found
+            - report_not_found
+            - idempotency_conflict
+            - invalid_transition
+            - source_unavailable
+            - too_few_reviews
+            - internal_error
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
+
+    Organization:
+      type: object
+      required: [id, name, city]
+      properties:
+        id: { type: string, examples: ["htl_0204"] }
+        name: { type: string }
+        city: { type: string }
+
+    CreateReport:
+      type: object
+      required: [organization_id]
+      properties:
+        organization_id: { type: string }
+
+    Report:
+      type: object
+      required: [id, organization_id, status]
+      properties:
+        id: { type: string, examples: ["rep_77"] }
+        organization_id: { type: string }
+        status:
+          type: string
+          enum: [created, collecting, analyzing, done, partial, insufficient, failed, cancelled]
+        reason:
+          type: string
+          description: Заполняется в недостаточных и отказных состояниях.
+          enum: [too_few_reviews, source_unavailable, cancelled_by_client, error]
+        coverage:
+          type: number
+          format: float
+          description: Доля неполученных отзывов, только для status=partial.
+          examples: [0.2]
+        verdict: { $ref: "#/components/schemas/Verdict" }
+
+    Verdict:
+      type: object
+      required: [aspects, rating_total, rating_excluding_suspicious, trend]
+      properties:
+        aspects:
+          type: object
+          additionalProperties:
+            type: object
+            required: [mean, negative_share, stable]
+            properties:
+              mean: { type: number, format: float }
+              negative_share: { type: number, format: float }
+              stable: { type: boolean }
+          description: "Ключи: food, service, cleanliness, location, price."
+        rating_total: { type: number, format: float }
+        rating_excluding_suspicious: { type: number, format: float }
+        trend:
+          type: string
+          enum: [improving, stable, worsening, unknown]
+          description: unknown — слишком мало отзывов за период для вывода.
